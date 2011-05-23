@@ -1,8 +1,9 @@
 import std.typetuple, std.parallelism, std.range, std.functional,
-    std.algorithm, std.stdio, dstats.alloc;
+    std.algorithm, std.stdio, std.array, std.traits, std.conv,
+    core.stdc.string;
 
 version(unittest) {
-    import std.random, std.typecons, dstats.sort;
+    import std.random, std.typecons, std.math;
 }
 
 private template finiteRandom(R) {
@@ -48,8 +49,7 @@ parallelSort(alias pred = "a < b", alias baseAlgorithm = std.algorithm.sort, R)(
     TaskPool pool = null
 ) if(finiteRandom!R && hasAssignableElements!R) {
     // TODO:  Use C heap or TempAlloc or something.
-    mixin(newFrame);
-    auto buf = newStack!(ElementType!(R))(range.length);
+    auto buf = new ElementType!(R)[range.length];
 
     if(pool is null) pool = std.parallelism.taskPool;
 
@@ -361,7 +361,82 @@ unittest {
     assert(buf == [1, 2, 2, 4, 4, 6, 8, 8, 10, 12, 16, 32]);
 }
 
-import std.random, std.datetime, std.exception, dstats.sort;
+CommonType!(ElementType!(Range1),ElementType!(Range2))
+parallelDotProduct(Range1, Range2)(
+    Range1 a,
+    Range2 b,
+    TaskPool pool = null,
+    size_t workUnitSize = size_t.max
+) if(isFloatingPoint!(ElementType!Range1) && isFloatingPoint!(ElementType!Range2)
+   && isRandomAccessRange!Range1 && isRandomAccessRange!Range2
+   && hasLength!Range1 && hasLength!Range2
+) in {
+    assert(a.length == b.length);
+} body {
+
+    if(pool is null) pool = taskPool;
+    if(workUnitSize == size_t.max) {
+        workUnitSize = pool.defaultWorkUnitSize(a.length);
+    }
+
+    alias typeof(return) F;
+
+    // A TaskPool.reduce/std.algorithm.map approach seems like the obvious one
+    // here, but std.numeric.dotProduct is so well optimized that I can't beat
+    // it unless I use it under the hood.  Create a range of dot products of
+    // slices, and let TaskPool.reduce handle the minutiae of sending each
+    // element to the task pool.  Eventually this slice-reduce paradigm
+    // needs to be extracted into reusable code.
+    static struct SliceDotProd {
+        Range1 a;
+        Range2 b;
+        size_t workUnitSize;
+
+        // These primitives are only needed to make this range
+        // pass the isRandomAccess test, but are never actually used.  Just make
+        // them stubs.
+        F front() @property { assert(0); }
+        void popFront() { assert(0); }
+        F back() @property { assert(0); }
+        void popBack() @property { assert(0); }
+        typeof(this) opSlice(size_t foo, size_t bar) { assert(0); }
+        bool empty() @property { assert(0); }
+
+        typeof(this) save() { return typeof(this)(a, b, workUnitSize); }
+
+        size_t length() @property {
+            assert(a.length == b.length);
+            return (a.length / workUnitSize) + (a.length % workUnitSize > 0);
+        }
+
+        F opIndex(size_t index) {
+            immutable start = workUnitSize * index;
+            immutable stop = min(a.length, workUnitSize * (index + 1));
+            assert(start <= stop, text(start, ' ', stop));
+            return std.numeric.dotProduct(a[start..stop], b[start..stop]);
+        }
+    }
+
+    return taskPool.reduce!"a + b"(cast(F) 0, SliceDotProd(a, b, workUnitSize), 1);
+}
+
+unittest {
+    auto a = new double[10_000];
+    auto b = new double[10_000];
+
+    foreach(i, ref elem; a) {
+        elem = i;
+        b[i] = i;
+    }
+
+    assert(approxEqual(std.numeric.dotProduct(a, b), parallelDotProduct(a, b, taskPool)));
+}
+
+
+//////////////////////////////////////////////////////////////////////////////
+// Benchmarks
+//////////////////////////////////////////////////////////////////////////////
+import std.random, std.datetime, std.exception, std.numeric;
 
 void mergeBenchmark() {
     enum N = 8192;
@@ -392,18 +467,39 @@ void sortBenchmark() {
     foreach(ref elem; a) elem = uniform(cast(ushort) 0, ushort.max);
 
     auto sw = StopWatch(AutoStart.yes);
-    qsort(a);
+    sort(a);
     writeln("Serial Sort:    ", sw.peek.usecs);
     enforce(isSorted(a));
 
     randomShuffle(a);
     sw.reset();
-    parallelSort!("a < b", qsort)(a, 4096, 4096);
+    parallelSort!("a < b", sort)(a, 4096, 4096);
     writeln("Parallel Sort:  ", sw.peek.usecs);
     enforce(isSorted(a));
 }
 
+void dotProdBenchmark() {
+    enum n = 100_000;
+    enum nIter = 100;
+    auto a = new float[n];
+    auto b = new float[n];
+
+    foreach(ref num; chain(a, b)) {
+        num = uniform(0.0, 1.0);
+    }
+
+    auto sw = StopWatch(AutoStart.yes);
+    foreach(i; 0..nIter) std.numeric.dotProduct(a, b);
+    writeln("Serial dot product:    ", sw.peek.msecs);
+
+    sw.reset();
+    foreach(i; 0..nIter) parallelDotProduct(a, b, taskPool);
+    writeln("Parallel dot product:  ", sw.peek.msecs);
+}
+
+
 void main() {
     mergeBenchmark();
     sortBenchmark();
+    dotProdBenchmark();
 }
