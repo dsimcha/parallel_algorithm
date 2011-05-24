@@ -361,6 +361,26 @@ unittest {
     assert(buf == [1, 2, 2, 4, 4, 6, 8, 8, 10, 12, 16, 32]);
 }
 
+// In a few implementations we need to create custom ranges to be reduced.
+// std.parallelism.reduce checks for a random access range to conform to
+// Phobos conventions but only actually uses opIndex and length.
+// This mixin adds stubs of the other primitives to pass
+// isRandomAccessRange.
+//
+// This returns a string instead of using mixin templates to get around some
+// weird forward referencing issues.
+private template dummyRangePrimitives(string elemType) {
+    enum string dummyRangePrimitives =
+    elemType ~ q{ front() @property { assert(0); }
+    } ~ elemType ~ q{ back() @property { assert(0); }
+    void popFront() { assert(0); }
+    void popBack() @property { assert(0); }
+    typeof(this) opSlice(size_t foo, size_t bar) { assert(0); }
+    typeof(this) save() { assert(0); }
+    bool empty() @property { assert(0); }
+    };
+}
+
 CommonType!(ElementType!(Range1),ElementType!(Range2))
 parallelDotProduct(Range1, Range2)(
     Range1 a,
@@ -392,17 +412,7 @@ parallelDotProduct(Range1, Range2)(
         Range2 b;
         size_t workUnitSize;
 
-        // These primitives are only needed to make this range
-        // pass the isRandomAccess test, but are never actually used.  Just make
-        // them stubs.
-        F front() @property { assert(0); }
-        void popFront() { assert(0); }
-        F back() @property { assert(0); }
-        void popBack() @property { assert(0); }
-        typeof(this) opSlice(size_t foo, size_t bar) { assert(0); }
-        bool empty() @property { assert(0); }
-
-        typeof(this) save() { return typeof(this)(a, b, workUnitSize); }
+        mixin(dummyRangePrimitives!"F");
 
         size_t length() @property {
             assert(a.length == b.length);
@@ -429,9 +439,64 @@ unittest {
         b[i] = i;
     }
 
-    assert(approxEqual(std.numeric.dotProduct(a, b), parallelDotProduct(a, b, taskPool)));
+    auto serial = std.numeric.dotProduct(a, b);
+    auto parallel = parallelDotProduct(a, b, taskPool);
+    assert(approxEqual(serial, parallel), text(serial, ' ', parallel));
 }
 
+size_t parallelCount(alias pred = "a == b", Range, E)
+(Range r, E value, TaskPool pool = null, size_t workUnitSize = size_t.max)
+if(isRandomAccessRange!Range && hasLength!Range) {
+
+    if(pool is null) pool = taskPool;
+
+    if(workUnitSize == size_t.max) {
+        workUnitSize = pool.defaultWorkUnitSize(r.length);
+    }
+
+    static struct MapPred {
+        Range r;
+        E value;
+
+        mixin(dummyRangePrimitives!"size_t");
+
+        size_t length() @property {
+            return r.length;
+        }
+
+        size_t opIndex(size_t index) {
+            return (binaryFun!pred(r[index], value)) ? 1 : 0;
+        }
+    }
+
+    return taskPool.reduce!"a + b"(
+        cast(size_t) 0, MapPred(r, value), workUnitSize
+    );
+}
+
+size_t parallelCount(alias pred = "true", Range)
+(Range r, TaskPool pool = null, size_t workUnitSize = size_t.max)
+if(isRandomAccessRange!Range && hasLength!Range) {
+
+    if(pool is null) pool = taskPool;
+
+    if(workUnitSize == size_t.max) {
+        workUnitSize = pool.defaultWorkUnitSize(r.length);
+    }
+
+    static size_t predToSizeT(T)(T val) {
+        return (unaryFun!pred(val)) ? 1 : 0;
+    }
+
+    return taskPool.reduce!"a + b"(cast(size_t) 0,
+        std.algorithm.map!predToSizeT(r), workUnitSize
+    );
+}
+
+unittest {
+    assert(parallelCount([1, 2, 1, 2, 3], 2) == 2);
+    assert(parallelCount!"a == 2"([1, 2, 1, 2, 3]) == 2);
+}
 
 //////////////////////////////////////////////////////////////////////////////
 // Benchmarks
@@ -497,9 +562,32 @@ void dotProdBenchmark() {
     writeln("Parallel dot product:  ", sw.peek.msecs);
 }
 
+void countBenchmark() {
+    enum n = 50_000;
+    enum nIter = 1_000;
+    auto nums = new int[n];
+    foreach(ref elem; nums) elem = uniform(0, 3);
+
+    auto sw = StopWatch(AutoStart.yes);
+    foreach(i; 0..nIter) count(nums, 2);
+    writeln("Serial count by value:    ", sw.peek.msecs);
+
+    sw.reset();
+    foreach(i; 0..nIter) parallelCount(nums, 2);
+    writeln("Parallel count by value:  ", sw.peek.msecs);
+
+    sw.reset();
+    foreach(i; 0..nIter) count!"a == 2"(nums);
+    writeln("Serial count by pred:    ", sw.peek.msecs);
+
+    sw.reset();
+    foreach(i; 0..nIter) parallelCount!"a == 2"(nums);
+    writeln("Parallel count by pred:  ", sw.peek.msecs);
+}
 
 void main() {
     mergeBenchmark();
     sortBenchmark();
     dotProdBenchmark();
+    countBenchmark();
 }
