@@ -1,6 +1,6 @@
 import std.typetuple, std.parallelism, std.range, std.functional,
     std.algorithm, std.stdio, std.array, std.traits, std.conv,
-    core.stdc.string;
+    core.stdc.string, core.atomic;
 
 version(unittest) {
     import std.random, std.typecons, std.math;
@@ -361,6 +361,82 @@ unittest {
     assert(buf == [1, 2, 2, 4, 4, 6, 8, 8, 10, 12, 16, 32]);
 }
 
+void parallelMergeInPlace(alias pred = "a < b", R)(
+    R range, 
+    size_t middle,
+    size_t minParallel = 1024,
+    TaskPool pool = null
+) {
+    if(pool is null) pool = taskPool;
+    immutable rlen = range.length;    
+    alias binaryFun!(pred) comp;
+
+    static size_t largestLess(T)(T[] data, T value) {
+        return assumeSorted!(comp)(data).lowerBound(value).length;
+    }
+
+    static size_t smallestGr(T)(T[] data, T value) {
+        return data.length - 
+            assumeSorted!(comp)(data).upperBound(value).length;
+    }
+
+    if (range.length < 2 || middle == 0 || middle == range.length) {
+        return;
+    }
+    
+    if (range.length == 2) {
+        if(comp(range[1], range[0])) {
+            swap(range[0], range[1]);
+        }
+        
+        return;
+    }
+
+    size_t half1, half2;
+
+    if (middle > range.length - middle) {
+        half1 = middle / 2;
+        auto pivot = range[half1];
+        half2 = largestLess(range[middle..rlen], pivot);
+    } else {
+        half2 = (range.length - middle) / 2;
+        auto pivot = range[half2 + middle];
+        half1 = smallestGr(range[0..middle], pivot);
+    }
+
+    bringToFront(range[half1..middle], range[middle..middle + half2]);
+    size_t newMiddle = half1 + half2;
+
+    auto left = range[0..newMiddle];
+    auto right = range[newMiddle..range.length];
+
+    if(left.length >= minParallel) {
+        auto leftTask = scopedTask!(parallelMergeInPlace!(pred, R))
+            (left, half1, minParallel, pool);
+        taskPool.put(leftTask);
+        parallelMergeInPlace!(pred, R)
+            (right, half2 + middle - newMiddle, minParallel, pool);
+        leftTask.yieldForce();
+    } else {
+        parallelMergeInPlace!(pred, R)(left, half1, minParallel, pool);
+        parallelMergeInPlace!(pred, R)
+            (right, half2 + middle - newMiddle, minParallel, pool);
+    }
+}
+
+unittest {
+    auto arr = new int[10_000];
+    
+    // Make sure serial and parallel both work by bypassing parallelism
+    // by making minParallel huge.
+    foreach(minParallel; [64, 20_000]) {
+        copy(iota(0, 10_000, 2), arr[0..5_000]);
+        copy(iota(1, 10_000, 2), arr[5_000..$]);
+        parallelMergeInPlace(arr, 5_000, minParallel);
+        assert(equal(arr, iota(10_000)), to!string(minParallel));
+    }
+}         
+
 // In a few implementations we need to create custom ranges to be reduced.
 // std.parallelism.reduce checks for a random access range to conform to
 // Phobos conventions but only actually uses opIndex and length.
@@ -498,6 +574,104 @@ unittest {
     assert(parallelCount!"a == 2"([1, 2, 1, 2, 3]) == 2);
 }
 
+void parallelAdjacentDifference(alias pred = "a - b", R1, R2)(
+    R1 input,
+    R2 output,
+    TaskPool pool = null,
+    size_t workUnitSize = size_t.max
+) if(allSatisfy!(isRandomAccessRange, TypeTuple!(R1, R2)) &&
+   hasAssignableElements!(R2) &&
+   is(typeof(binaryFun!pred(R1.init[0], R1.init[1])) : ElementType!R2)
+) {
+    static size_t getLength(R)(ref R range) {
+        static if(is(typeof(range.length) : size_t)) {
+            return range.length;
+        } else {
+            return size_t.max;
+        }
+    }
+
+    // getLength(output) + 1 because we need one less element in output
+    // than we had in input.
+    immutable minLen = min(getLength(input), getLength(output) + 1);
+    if(pool is null) pool = taskPool;
+
+    if(workUnitSize == size_t.max) {
+        workUnitSize = pool.defaultWorkUnitSize(minLen - 1);
+    }
+
+    // Using parallel foreach to iterate over individual elements is too
+    // slow b/c of delegate overhead for such fine grained parallelism.
+    // Use parallel foreach to iterate over slices and handle them serially.
+    auto sliceStarts = iota(0, minLen - 1, workUnitSize);
+
+    foreach(startIndex; pool.parallel(sliceStarts, 1)) {
+        immutable endIndex = min(startIndex + workUnitSize, minLen - 1);
+
+        // This avoids some indirection and seems to be faster.
+        auto ip = input;
+        auto op = output;
+
+        foreach(i; startIndex..endIndex) {
+            op[i] = binaryFun!pred(ip[i + 1], ip[i]);
+        }
+    }
+}
+
+unittest {
+    auto input = [1, 2, 4, 8, 16, 32];
+    auto output = new int[5];
+    parallelAdjacentDifference(input, output);
+    assert(output == [1, 2, 4, 8, 16]);
+}
+
+bool parallelEqual(alias pred = "a == b", R1, R2)(
+    R1 range1, 
+    R2 range2,
+    size_t workUnitSize = size_t.max,
+    TaskPool pool = null
+) 
+if(isRandomAccessRange!R1 && isRandomAccessRange!R2 &&
+hasLength!R1 && hasLength!R2) {
+    
+    if(range1.length != range2.length) return false;
+    immutable len = range1.length;
+    
+    if(pool is null) pool = taskPool;
+    if(workUnitSize == size_t.max) {
+        workUnitSize = pool.defaultWorkUnitSize(len);
+    }
+    
+    auto chunks1 = std.range.chunks(range1, workUnitSize);   
+    auto chunks2 = std.range.chunks(range2, workUnitSize);   
+    assert(chunks1.length == chunks2.length);
+    immutable nChunks = chunks1.length;
+    
+    bool ret = true;
+    
+    try {
+        foreach(chunkIndex; pool.parallel(iota(nChunks), 1)) {
+            auto c1 = chunks1[chunkIndex];
+            auto c2 = chunks2[chunkIndex];
+            if(!std.algorithm.equal!pred(c1, c2)) {
+                atomicStore(ret, false);
+                break;
+            }
+        }
+    } catch(ParallelForeachError) {
+        // Ignore it.  It's because we tried to break out of a parallel
+        // foreach loop. 
+    }
+    
+    return ret;
+}    
+
+unittest {
+    assert(parallelEqual([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]));
+    assert(!parallelEqual([1, 2, 3, 4, 5, 6], [1, 3, 3, 4, 5, 6]));
+    assert(!parallelEqual([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7]));
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Benchmarks
 //////////////////////////////////////////////////////////////////////////////
@@ -523,6 +697,42 @@ void mergeBenchmark() {
     foreach(i; 0..nIter) parallelMerge(a, b, buf, 2048);
     writeln("Parallel Merge:  ", sw.peek.msecs);
     assert(equal(buf, sort(a ~ b)));
+}
+
+void mergeInPlaceBenchmark() {
+    enum N = 8192;
+    enum nIter = 100;
+    auto ab = new float[2 * N];
+    auto a = ab[0..$ / 2];
+    auto b = ab[$ / 2..$];
+
+    foreach(ref elem; ab) elem = uniform(0f, 1f);
+
+    auto sw = StopWatch(AutoStart.no);
+    foreach(i; 0..nIter) {
+        randomShuffle(ab);
+        sort(a);
+        sort(b);
+        sw.start();
+        
+        // Disable parallelism by setting minParallel to be bigger than N.
+        parallelMergeInPlace(ab, N / 2, N + 1);
+        sw.stop();
+    }
+    writeln("Serial In-place Merge:  ", sw.peek.msecs);
+
+    sw.reset();
+    foreach(i; 0..nIter) {
+        randomShuffle(ab);
+        sort(a);
+        sort(b);
+        sw.start();
+        
+        // Use default minParallel.
+        parallelMergeInPlace(ab, N / 2);
+        sw.stop();
+    }
+    writeln("Parallel In-place Merge:  ", sw.peek.msecs);
 }
 
 void sortBenchmark() {
@@ -563,7 +773,7 @@ void dotProdBenchmark() {
 }
 
 void countBenchmark() {
-    enum n = 50_000;
+    enum n = 3_000;
     enum nIter = 1_000;
     auto nums = new int[n];
     foreach(ref elem; nums) elem = uniform(0, 3);
@@ -585,9 +795,53 @@ void countBenchmark() {
     writeln("Parallel count by pred:  ", sw.peek.msecs);
 }
 
+void adjacentDifferenceBenchmark() {
+    enum n = 500_000;
+    enum nIter = 100;
+
+    auto input = new int[n];
+    auto output = new int[n - 1];
+    foreach(ref elem; input) {
+        elem = uniform(0, 10_000);
+    }
+
+    auto sw = StopWatch(AutoStart.yes);
+    foreach(iter; 0..nIter) {
+        // Quick n' dirty inline serial impl.
+        foreach(i; 0..n - 1) {
+            output[i] = input[i + 1] - input[i];
+        }
+    }
+
+    writeln("Serial adjacent difference:  ", sw.peek.msecs);
+
+    sw.reset();
+    foreach(iter; 0..nIter) parallelAdjacentDifference(input, output);
+    writeln("Parallel adjacent difference:  ", sw.peek.msecs);
+}
+
+void equalBenchmark() {
+    enum n = 20_000;
+    enum nIter = 1_000;
+    
+    auto a = new int[n];
+    auto b = new int[n];
+    
+    auto sw = StopWatch(AutoStart.yes);
+    foreach(i; 0..nIter) equal(a, b);
+    writeln("Serial equal:  ", sw.peek.msecs);
+    
+    sw.reset();
+    foreach(i; 0..nIter) parallelEqual(a, b);
+    writeln("Parallel equal:  ", sw.peek.msecs);
+}
+
 void main() {
     mergeBenchmark();
+    mergeInPlaceBenchmark();
     sortBenchmark();
     dotProdBenchmark();
     countBenchmark();
+    adjacentDifferenceBenchmark();
+    equalBenchmark();
 }
