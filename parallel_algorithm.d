@@ -999,6 +999,7 @@ void findBenchmark() {
     }
     writeln("Parallel predicate find:  ", sw.peek.msecs);
     
+    sw.reset();
     foreach(i; 0..nIter) {
         randomShuffle(nums);
         sw.start();
@@ -1015,6 +1016,32 @@ void findBenchmark() {
         sw.stop();
     }
     writeln("Parallel haystack find:  ", sw.peek.msecs);
+    
+    static int[] serialAdjacentFind(int[] nums) {
+        foreach(i; 0..nums.length - 1) {
+            if(nums[i] == nums[i + 1]) return nums[i..$];
+        }
+        
+        return null;
+    }
+    
+    sw.reset();
+    foreach(i; 0..nIter) {
+        randomShuffle(nums);
+        sw.start();
+        serialAdjacentFind(nums);
+        sw.stop();
+    }
+    writeln("Serial adjacent find:  ", sw.peek.msecs);
+    
+    sw.reset();
+    foreach(i; 0..nIter) {
+        randomShuffle(nums);
+        sw.start();
+        parallelAdjacentFind(nums);
+        sw.stop();
+    }
+    writeln("Parallel adjacent find:  ", sw.peek.msecs);
 }    
 
 void main() {
