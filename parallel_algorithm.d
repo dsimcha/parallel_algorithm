@@ -784,6 +784,34 @@ unittest {
     assert(parallelFind!"a == 6"(foo) == foo[7..$]);
 }
 
+Range parallelAdjacentFind(alias pred = "a == b", Range)(
+    Range range,
+    size_t workUnitSize = 250,
+    TaskPool pool = null
+) if(isRandomAccessRange!Range && hasLength!Range) {
+    
+    immutable len = range.length;
+    if(len < 2) {
+        return range[len..len];
+    }
+    
+    bool nextEqual(size_t i) {
+        assert(i < len - 1);
+        return binaryFun!pred(range[i], range[i + 1]);
+    }
+    
+    auto indices = parallelFind!nextEqual(iota(len - 1), workUnitSize, pool);
+    if(!indices.length) return range[len..len];
+    return range[indices.front..len];
+}
+
+unittest {
+    auto foo = [8, 6, 7, 5, 3, 0, 9, 3, 6, 2, 4, 3, 6, 8, 8, 0, 9, 6];
+    auto bar = iota(666);
+    assert(parallelAdjacentFind(foo) == [8, 8, 0, 9, 6]);
+    assert(parallelAdjacentFind(bar).empty);
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Benchmarks
 //////////////////////////////////////////////////////////////////////////////
