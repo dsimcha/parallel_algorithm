@@ -476,34 +476,16 @@ parallelDotProduct(Range1, Range2)(
     }
 
     alias typeof(return) F;
-
-    // A TaskPool.reduce/std.algorithm.map approach seems like the obvious one
-    // here, but std.numeric.dotProduct is so well optimized that I can't beat
-    // it unless I use it under the hood.  Create a range of dot products of
-    // slices, and let TaskPool.reduce handle the minutiae of sending each
-    // element to the task pool.  Eventually this slice-reduce paradigm
-    // needs to be extracted into reusable code.
-    static struct SliceDotProd {
-        Range1 a;
-        Range2 b;
-        size_t workUnitSize;
-
-        mixin(dummyRangePrimitives!"F");
-
-        size_t length() @property {
-            assert(a.length == b.length);
-            return (a.length / workUnitSize) + (a.length % workUnitSize > 0);
-        }
-
-        F opIndex(size_t index) {
-            immutable start = workUnitSize * index;
-            immutable stop = min(a.length, workUnitSize * (index + 1));
-            assert(start <= stop, text(start, ' ', stop));
-            return std.numeric.dotProduct(a[start..stop], b[start..stop]);
-        }
+    static F doSlice(T)(T tuple) {
+        return std.numeric.dotProduct(tuple[0], tuple[1]);
     }
+    
+    auto chunks1 = std.range.chunks(a, workUnitSize);
+    auto chunks2 = std.range.chunks(a, workUnitSize);
+    auto chunkPairs = zip(chunks1, chunks2);
+    auto dots = map!doSlice(chunkPairs);
 
-    return taskPool.reduce!"a + b"(cast(F) 0, SliceDotProd(a, b, workUnitSize), 1);
+    return taskPool.reduce!"a + b"(cast(F) 0, dots, 1);
 }
 
 unittest {
@@ -628,19 +610,17 @@ unittest {
 bool parallelEqual(alias pred = "a == b", R1, R2)(
     R1 range1, 
     R2 range2,
-    size_t workUnitSize = size_t.max,
+    size_t workUnitSize = 2000,
     TaskPool pool = null
-) 
-if(isRandomAccessRange!R1 && isRandomAccessRange!R2 &&
+) if(isRandomAccessRange!R1 && isRandomAccessRange!R2 &&
 hasLength!R1 && hasLength!R2) {
     
     if(range1.length != range2.length) return false;
     immutable len = range1.length;
     
     if(pool is null) pool = taskPool;
-    if(workUnitSize == size_t.max) {
-        workUnitSize = pool.defaultWorkUnitSize(len);
-    }
+    immutable nThreads = pool.size + 1;
+    if(nThreads == 1) return std.algorithm.equal!pred(range1, range2);
     
     auto chunks1 = std.range.chunks(range1, workUnitSize);   
     auto chunks2 = std.range.chunks(range2, workUnitSize);   
@@ -648,28 +628,160 @@ hasLength!R1 && hasLength!R2) {
     immutable nChunks = chunks1.length;
     
     bool ret = true;
+    size_t currentChunkIndex = size_t.max;
     
-    try {
-        foreach(chunkIndex; pool.parallel(iota(nChunks), 1)) {
-            auto c1 = chunks1[chunkIndex];
-            auto c2 = chunks2[chunkIndex];
-            if(!std.algorithm.equal!pred(c1, c2)) {
+    foreach(threadId; parallel(iota(nThreads), 1)) {
+        
+        while(true) {
+            immutable myChunkIndex = atomicOp!"+="(currentChunkIndex, 1);
+            if(myChunkIndex >= nChunks) break;
+            
+            auto myChunk1 = chunks1[myChunkIndex];
+            auto myChunk2 = chunks2[myChunkIndex];
+            if(!std.algorithm.equal!pred(myChunk1, myChunk2)) {
                 atomicStore(ret, false);
                 break;
             }
+            
+            if(!atomicLoad(ret)) break;
         }
-    } catch(ParallelForeachError) {
-        // Ignore it.  It's because we tried to break out of a parallel
-        // foreach loop. 
-    }
+    }    
     
     return ret;
 }    
 
 unittest {
-    assert(parallelEqual([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]));
-    assert(!parallelEqual([1, 2, 3, 4, 5, 6], [1, 3, 3, 4, 5, 6]));
-    assert(!parallelEqual([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7]));
+    assert(parallelEqual([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], 3));
+    assert(!parallelEqual([1, 2, 3, 4, 5, 6], [1, 3, 3, 4, 5, 6], 3));
+    assert(!parallelEqual([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7], 3));
+}
+
+/+
+void parallelPrefixSum(alias pred = "a + b", R1, R2)(
+    R1 input,
+    R2 output,
+    size_t workUnitSize = 1_024,
+    TaskPool pool = null
+) {
+    enforce(input.length == output.length, format(
+        "input.length must equal output.length for parallelPrefixSum.  " ~
+        "(Got:  input.length = %d, output.length = %d).",
+        input.length, output.length
+    );
+    
+    alias binaryFun!pred fun;
+    if(pool is null) pool = taskPool;
+    
+    if(workUnitSize & 1) workUnitSize++;  // It can't be odd.
+    if(workUnitSize > input.length) workUnitSize = input.length;
+    
+    // TODO:  Use a better temporary allocation scheme than the GC.
+    auto temp = new ElementType!R2[output.length];
+    size_t tempStart = 0;
+    
+    static void impl(R1 input, typeof(temp) output, size_t workUnitSize) {
+        auto len = input.length;
+        if(len & 1) len--;  // Handle odd stuff at the end.
+        auto steps = iota(0, len, workUnitSize);
+        
+        if(steps.length > 1) {
+            foreach(stepStart; parallel(steps, 1)) {
+                immutable stepEnd = min(stepStart + workUnitSize, len);
+                
+                for(size_t i = 0; i < stepEnd; i += 2) {
+                    output[i / 2] = input[i] + input[i + 1];
+                }
+            }
+        } else {
+            // Avoid some constant overhead.
+            for(size_t i = 0; i < len; i += 2) {
+                output[i / 2] = input[i] + input[i + 1];
+            }
+        }
+        
+        impl(output[0..(len - 1) +/
+             
+Range parallelFind(alias pred = "a == b", Range, E)(
+    Range haystack,
+    E needle,
+    size_t workUnitSize = 250,
+    TaskPool pool = null
+) if(isRandomAccessRange!Range && hasLength!Range) {
+    
+    bool newPred(ElementType!Range elem) {
+        return binaryFun!pred(elem, needle);
+    }
+    
+    return parallelFind!newPred(haystack, workUnitSize, pool);
+}
+
+unittest {
+    auto foo = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4, 6, 
+        2, 6, 4, 3, 3, 8, 3, 2, 7, 9, 5, 0, 2, 8, 8, 4, 1, 9, 7, 1, 6];
+    
+    assert(parallelFind(foo, 9) == foo[5..$]);
+    assert(parallelFind(foo, 1) == foo[1..$]);
+    assert(parallelFind(foo, 6) == foo[7..$]);
+}
+        
+Range parallelFind(alias pred, Range)(
+    Range haystack,
+    size_t workUnitSize = 250,
+    TaskPool pool = null
+) if(isRandomAccessRange!Range && hasLength!Range) {
+    
+    if(pool is null) pool = taskPool;  
+    immutable nThreads = pool.size + 1;
+    if(nThreads == 1) return std.algorithm.find!(pred, Range)(haystack);
+    
+    immutable len = haystack.length;
+    
+    // This variable stores the index of the earliest hit found so far.
+    shared size_t minHitIndex = len;
+    
+    // This function atomically sets minHitIndex to newIndex iff newIndex <
+    // minHitIndex.  The nature of minHitIndex is that it can never get smaller,
+    // so if newIndex is not smaller than minHitIndex, we don't need to do
+    // a CAS.
+    void atomicMinHitIndex(size_t newIndex) {
+        size_t old = void;
+        
+        do {
+            old = atomicLoad!(msync.raw)(minHitIndex);
+            if(newIndex >= old) return;
+        } while(!cas(&minHitIndex, old, newIndex));
+    }
+    
+    size_t sliceIndex = size_t.max;
+    
+    foreach(threadId; parallel(iota(nThreads), 1)) {
+       
+        while(true) {
+            immutable myIndex = atomicOp!"+="(sliceIndex, 1);        
+            immutable sliceStart = sliceIndex * workUnitSize;
+            if(sliceStart >= len) break;               
+            if(atomicLoad(minHitIndex) < sliceStart) break;
+            
+            immutable sliceEnd = min(len, (sliceIndex + 1) * workUnitSize);
+            foreach(i; sliceStart..sliceEnd) {
+                if(unaryFun!pred(haystack[i])) {
+                    atomicMinHitIndex(i);
+                    break;
+                }
+            }
+        }
+    }
+    
+    return haystack[minHitIndex..len];
+}
+
+unittest {
+    auto foo = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4, 6, 
+        2, 6, 4, 3, 3, 8, 3, 2, 7, 9, 5, 0, 2, 8, 8, 4, 1, 9, 7, 1, 6];
+    
+    assert(parallelFind!"a == 9"(foo) == foo[5..$]);
+    assert(parallelFind!"a == 1"(foo) == foo[1..$]);
+    assert(parallelFind!"a == 6"(foo) == foo[7..$]);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -836,6 +948,47 @@ void equalBenchmark() {
     writeln("Parallel equal:  ", sw.peek.msecs);
 }
 
+void findBenchmark() {
+    enum n = 100_000;
+    enum nIter = 1_000;
+    auto nums = array(iota(n));
+    
+    auto sw = StopWatch(AutoStart.no);
+    foreach(i; 0..nIter) {
+        randomShuffle(nums);
+        sw.start();
+        find!"a == 1"(nums);
+        sw.stop();
+    }
+    writeln("Serial predicate find:  ", sw.peek.msecs);
+    
+    sw.reset();
+    foreach(i; 0..nIter) {
+        randomShuffle(nums);
+        sw.start();
+        parallelFind!"a == 1"(nums);
+        sw.stop();
+    }
+    writeln("Parallel predicate find:  ", sw.peek.msecs);
+    
+    foreach(i; 0..nIter) {
+        randomShuffle(nums);
+        sw.start();
+        find(nums, 1);
+        sw.stop();
+    }
+    writeln("Serial haystack find:  ", sw.peek.msecs);
+    
+    sw.reset();
+    foreach(i; 0..nIter) {
+        randomShuffle(nums);
+        sw.start();
+        parallelFind(nums, 1);
+        sw.stop();
+    }
+    writeln("Parallel haystack find:  ", sw.peek.msecs);
+}    
+
 void main() {
     mergeBenchmark();
     mergeInPlaceBenchmark();
@@ -844,4 +997,5 @@ void main() {
     countBenchmark();
     adjacentDifferenceBenchmark();
     equalBenchmark();
+    findBenchmark();
 }
