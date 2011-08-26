@@ -810,6 +810,102 @@ unittest {
     auto bar = iota(666);
     assert(parallelAdjacentFind(foo) == [8, 8, 0, 9, 6]);
     assert(parallelAdjacentFind(bar).empty);
+}  
+
+string parallelArrayOp
+(string workUnitSize = "1_000", string pool = "taskPool")
+(string[] operation...) {
+    string[] evens, odds;
+    
+    foreach(i, op; operation) {
+        if(i & 1) {
+            odds ~= '"' ~ op ~ '"';
+        } else {
+            evens ~= op;
+        }
+    }
+    
+    return "arrayOpImpl!(" ~ std.array.join(odds, ", ") ~ 
+        ").parallelArrayOp(" ~
+        std.array.join(evens, ", ") ~ ", " ~ workUnitSize ~ ", " ~
+        pool ~ ");";
+}
+
+template arrayOpImpl(ops...) {
+    // Code generation function for parallelArrayOp.
+    private string generateChunkCode(Operands...)() {
+        static assert(isArray!(Operands[0]),
+            "Cannot do parallel array ops if the lhs of the expression is " ~
+            "not an array."
+        );
+        
+        import std.string;
+        
+        string ret = `
+            immutable len = operands[0].length;
+            immutable chunkStart = myChunk * workUnitSize;
+            if(chunkStart >= len) break;
+            immutable chunkEnd = min(chunkStart + workUnitSize, len);
+            operands[0][chunkStart..chunkEnd] `;
+        
+        assert(std.string.indexOf(ops[0], "=") >-1,
+            "Cannot do a parallel array op where the second argument is not " ~
+            "some kind of assignment statement.  (Got:  " ~ ops[0] ~ ")."
+        );
+        
+        foreach(i, op; ops) {
+            ret ~= op;
+            
+            ret ~= " operands[" ~ to!string(i + 1) ~ "]";
+            if(isArray!(Operands[i + 1])) {
+                ret ~= "[chunkStart..chunkEnd] ";
+            }
+        }
+        
+        ret ~= ';';
+        return ret;
+    }        
+        
+    void parallelArrayOp(Operands...)(
+        Operands operands,
+        size_t workUnitSize,
+        TaskPool pool
+    ) if(Operands.length >= 2) {
+        if(pool is null) pool = taskPool;
+        immutable nThread = pool.size + 1;
+        size_t workUnitIndex = size_t.max;
+        
+        foreach(thread; parallel(iota(nThread), 1)) {
+            while(true) {
+                immutable myChunk = atomicOp!"+="(workUnitIndex, 1);
+                enum code = generateChunkCode!(Operands)();
+                mixin(code);
+            }
+        }    
+    }
+}
+
+unittest {
+    {
+        auto lhs = [1, 2, 3, 4, 5, 6, 7, 9, 10, 11];
+        auto lhs2 = lhs.dup;
+        mixin(parallelArrayOp!("2")("lhs[]", "*=", "2"));
+        lhs2[] *= 2;
+        assert(equal(lhs, lhs2), text(lhs));
+    }
+    
+    {
+        double[] lhs = new double[7];
+        double[] o1 = [8, 6, 7, 5, 3, 0, 9];
+        double[] o2 = [3, 1, 4, 1, 5, 9, 2];
+        double[] o3 = [2, 7, 1, 8, 2, 8, 1];
+        
+        mixin(parallelArrayOp!"2"(
+            "lhs[]", "=", "o1[]", "*", "o2[]", "+", "2", "*", "o3[]"
+        ));
+        
+        assert(lhs == [28, 20, 30, 21, 19, 16, 20]);
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1044,7 +1140,36 @@ void findBenchmark() {
     writeln("Parallel adjacent find:  ", sw.peek.msecs);
 }    
 
+void arrayOpBenchmark() {
+    enum n = 10_000;
+    enum nIter = 5_000;
+    
+    auto lhs = new double[n];
+    auto op1 = new double[n];
+    auto op2 = new double[n];
+    auto op3 = new double[n];
+    
+    foreach(ref elem; chain(lhs, op1, op2, op3)) {
+        elem = uniform(0.0, 1.0);
+    }
+    
+    auto sw = StopWatch(AutoStart.yes);
+    foreach(iter; 0..nIter) {
+        lhs[] = op1[] * op2[] / op3[];
+    }
+    writeln("Serial array multiply:  ", sw.peek.msecs);
+    
+    sw.reset();
+    foreach(iter; 0..nIter) {
+        mixin(parallelArrayOp(
+            "lhs[]", "=", "op1[]", "*", "op2[]", "/", "op3[]")
+        );
+    }
+    writeln("Parallel array multiply:  ", sw.peek.msecs);
+}
+
 void main() {
+    arrayOpBenchmark();
     mergeBenchmark();
     mergeInPlaceBenchmark();
     sortBenchmark();
